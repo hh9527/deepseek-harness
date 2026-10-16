@@ -105,6 +105,53 @@ async function until(predicate: () => boolean): Promise<void> {
   if (!predicate()) throw new Error('until: condition never held')
 }
 
+describe('tool argument feedback', () => {
+  it.each(['{"id":"bad"', '{"id":"unescaped "quote""}', '[]', 'null', '"text"'])(
+    'rejects %s without execution, preserves siblings and accepts a corrected call', async (raw) => {
+      const first = multiCall([
+        { id: 'bad', name: 'probe', args: {} },
+        { id: 'good', name: 'probe', args: { id: 'good' } },
+      ])
+      for (const chunk of first) {
+        if (chunk.type === 'block-end' && chunk.block.type === 'tool-call' && chunk.block.id === 'bad') {
+          chunk.block.arguments = raw
+        }
+      }
+      const adapter = new MockAdapter([
+        first,
+        multiCall([{ id: 'fixed', name: 'probe', args: { id: 'fixed' } }]),
+        textResponse('done'),
+      ])
+      const ctx = await harness(adapter)
+      onTestFinished(() => ctx.fiber.dispose())
+      const executed: string[] = []
+      ctx.tools.register(defineContentToolFixture({
+        name: 'probe', description: 'Record a validated id',
+        parameters: { id: { type: 'string', required: true } },
+        isConcurrencySafe: () => true,
+        async execute(args) {
+          executed.push(args.id)
+          return [{ type: 'text', text: args.id }]
+        },
+      }))
+      const agent = await ctx.agentLoop.create(SessionId('argument-feedback'), { provider: 'mock', model: 'mock' })
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await agent.whenIdle()
+      expect(executed).toEqual(['good', 'fixed'])
+      const results = events(agent).filter(event => event.type === 'tool/result')
+      expect(results.map(event => event.data.message.toolCallId)).toEqual(['bad', 'good', 'fixed'])
+      expect(results[0]?.data).toMatchObject({
+        error: { code: 'INVALID_ARGS' },
+        message: { isError: true, content: [{ type: 'text', text: 'Error: invalid arguments: "arguments" must be an object' }] },
+      })
+      expect(adapter.requests[1]?.messages).toContainEqual(results[0]?.data.message)
+      expect(events(agent).filter(event => event.type === 'tool/call')[0]?.data.arguments).toBe(raw)
+      expect(events(agent).filter(event => event.type === 'turn/end').at(-1)?.data.reason).toEqual({ kind: 'completed' })
+      expect(adapter.requests).toHaveLength(3)
+    },
+  )
+})
+
 describe('tool-call scheduler: grouping and barriers', () => {
   it('runs parallel-safe siblings concurrently (all start before any completes)', async () => {
     const adapter = new MockAdapter([
